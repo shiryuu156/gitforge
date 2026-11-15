@@ -87,6 +87,12 @@ function advertiseV2(): Buffer {
   return ADVERTISE_V2;
 }
 
+/** The `# service=...` preamble (+ flush) of a v0 advertisement: constant per service. */
+const ADVERTISE_V0_PREAMBLE: Readonly<Record<'git-upload-pack' | 'git-receive-pack', Buffer>> = Object.freeze({
+  'git-upload-pack': Buffer.concat([pktLine('# service=git-upload-pack\n'), pktFlush()]),
+  'git-receive-pack': Buffer.concat([pktLine('# service=git-receive-pack\n'), pktFlush()]),
+});
+
 /**
  * v0 ref advertisement (upload-pack without the v2 header, or receive-pack).
  * First line is the `# service=...` preamble + flush, then ref lines; the first ref line
@@ -97,7 +103,7 @@ function advertiseV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'
     service === 'git-receive-pack'
       ? 'report-status side-band-64k delete-refs symref=HEAD:refs/heads/main'
       : 'side-band-64k shallow symref=HEAD:refs/heads/main';
-  const parts: Buffer[] = [pktLine(`# service=${service}\n`), pktFlush()];
+  const parts: Buffer[] = [ADVERTISE_V0_PREAMBLE[service]];
   const refs = sortedRefs(repo);
   const mainTip = repo.refs.get('refs/heads/main');
   if (refs.length === 0) {
@@ -329,12 +335,23 @@ function computeFetch(
 
 /** Encode pack bytes as band-1 sideband pkt-lines (≤65515 band bytes each). */
 function sidebandPack(pack: Buffer): Buffer {
+  // One allocation per chunk (header + band byte + chunk bytes, written in place),
+  // and a single buffer when the pack fits in one chunk (the common case).
+  if (pack.length <= SIDEBAND_CHUNK) {
+    const out = Buffer.allocUnsafe(pack.length + 5);
+    out.write((pack.length + 5).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    out[4] = 1;
+    pack.copy(out, 5);
+    return out;
+  }
   const parts: Buffer[] = [];
   for (let off = 0; off < pack.length; off += SIDEBAND_CHUNK) {
     const chunk = pack.subarray(off, Math.min(off + SIDEBAND_CHUNK, pack.length));
-    const payload = Buffer.concat([Buffer.from([1]), chunk]);
-    const head = Buffer.from((payload.length + 4).toString(16).padStart(4, '0'), 'ascii');
-    parts.push(Buffer.concat([head, payload]));
+    const out = Buffer.allocUnsafe(chunk.length + 5);
+    out.write((chunk.length + 5).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    out[4] = 1;
+    chunk.copy(out, 5);
+    parts.push(out);
   }
   return Buffer.concat(parts);
 }
@@ -352,6 +369,11 @@ const fetchCaches = new WeakMap<Repo, Map<string, Buffer>>();
 const FETCH_CACHE_MAX = 128;
 
 function fetchCacheKey(version: 'v0' | 'v2', req: FetchRequest): string {
+  // Fast path: the clone workload's fetch is one want, no haves, no shallow —
+  // no sorting or array-joining needed (same string the general path builds).
+  if (req.wants.length <= 1 && req.haves.length === 0 && req.shallow.length === 0) {
+    return `${version}|${req.wants[0] ?? ''}||${req.deepen ?? ''}|`;
+  }
   return [
     version,
     [...req.wants].sort().join(','),

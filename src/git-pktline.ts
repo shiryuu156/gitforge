@@ -8,30 +8,63 @@ export const RESPONSE_END = '0002';
 
 /** Encode one pkt-line. `line` must not contain a trailing newline unless intended. */
 export function pktLine(line: string): Buffer {
-  const payload = Buffer.from(line, 'utf8');
-  const len = payload.length + 4;
-  const head = Buffer.from(len.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([head, payload]);
+  // One allocation: write the 4-hex length header and the payload straight into it.
+  // (The old form built three buffers per line — payload, header, concat result.)
+  const payloadLen = Buffer.byteLength(line, 'utf8');
+  const out = Buffer.allocUnsafe(payloadLen + 4);
+  out.write((payloadLen + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  out.write(line, 4, 'utf8');
+  return out;
 }
+
+/** Shared flush/delim/response-end packets: constant bytes, never mutated by callers. */
+const FLUSH_BUF: Buffer = Buffer.from(FLUSH, 'ascii');
+const DELIM_BUF: Buffer = Buffer.from(DELIM, 'ascii');
+const RESPONSE_END_BUF: Buffer = Buffer.from(RESPONSE_END, 'ascii');
 
 /** Encode a flush packet. */
 export function pktFlush(): Buffer {
-  return Buffer.from(FLUSH, 'ascii');
+  return FLUSH_BUF;
 }
 
 /** Encode a delimiter packet (v2). */
 export function pktDelim(): Buffer {
-  return Buffer.from(DELIM, 'ascii');
+  return DELIM_BUF;
 }
 
 /** Encode a response-end packet (v2). */
 export function pktResponseEnd(): Buffer {
-  return Buffer.from(RESPONSE_END, 'ascii');
+  return RESPONSE_END_BUF;
 }
 
 /** Concatenate pkt-lines for a list of lines, each terminated with '\n' unless already. */
 export function pktLines(lines: readonly string[]): Buffer {
-  return Buffer.concat(lines.map((l) => pktLine(l.endsWith('\n') ? l : `${l}\n`)));
+  // One allocation for the whole list: measure every line, then fill once.
+  if (lines.length === 0) return Buffer.alloc(0);
+  if (lines.length === 1) {
+    const only = lines[0] as string;
+    return pktLine(only.endsWith('\n') ? only : `${only}\n`);
+  }
+  const texts: string[] = new Array(lines.length);
+  const lens: number[] = new Array(lines.length);
+  let total = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    const l = lines[i] as string;
+    const t = l.endsWith('\n') ? l : `${l}\n`;
+    texts[i] = t;
+    const n = Buffer.byteLength(t, 'utf8');
+    lens[i] = n;
+    total += n + 4;
+  }
+  const out = Buffer.allocUnsafe(total);
+  let off = 0;
+  for (let i = 0; i < texts.length; i += 1) {
+    const n = lens[i] as number;
+    out.write((n + 4).toString(16).padStart(4, '0'), off, 4, 'ascii');
+    off += 4;
+    off += out.write(texts[i] as string, off, 'utf8');
+  }
+  return out;
 }
 
 /** A parsed pkt-line stream: lines (without trailing newline), flush/delim markers. */
