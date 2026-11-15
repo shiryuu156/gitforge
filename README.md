@@ -1,5 +1,9 @@
 # github-core-clone-01 forge
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/shiryuu156/gitforge/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/shiryuu156/gitforge/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
 A standalone, GitHub-compatible git forge in one Node.js process — the entry for the
 [make.fun bounty](https://make.fun/bounty/github-core-clone-01). No dependencies at run
 time, no git binary, no database: the whole forge is the standard library plus this source,
