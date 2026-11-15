@@ -28,6 +28,15 @@ export interface GitObject {
 /** In-memory object database for one repository. */
 export class ObjectStore {
   readonly objects = new Map<string, GitObject>();
+  /**
+   * Parsed-form caches. Objects are immutable once stored (put/putKnown never
+   * overwrite), so a parsed commit/tree stays valid for the store's life.
+   * The push workload walks the same commits again and again (isAncestor is
+   * O(chain) per push, and every fetch re-parses the trees it packs), so
+   * caching the parse turns repeated O(bytes) work into O(1) lookups.
+   */
+  private readonly commitCache = new Map<string, CommitInfo>();
+  private readonly treeCache = new Map<string, TreeEntry[]>();
 
   has(oid: string): boolean {
     return this.objects.has(oid);
@@ -47,6 +56,28 @@ export class ObjectStore {
   /** Store an object whose id is already known (from a pack). */
   putKnown(oid: string, type: GitObjectType, data: Buffer): void {
     if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+  }
+
+  /** Parse a commit once, then serve the cached form. Undefined when absent/not a commit. */
+  commitInfo(oid: string): CommitInfo | undefined {
+    const cached = this.commitCache.get(oid);
+    if (cached !== undefined) return cached;
+    const obj = this.objects.get(oid);
+    if (obj === undefined || obj.type !== 'commit') return undefined;
+    const info = parseCommit(obj.data);
+    this.commitCache.set(oid, info);
+    return info;
+  }
+
+  /** Parse a tree once, then serve the cached form. Undefined when absent/not a tree. */
+  treeEntries(oid: string): TreeEntry[] | undefined {
+    const cached = this.treeCache.get(oid);
+    if (cached !== undefined) return cached;
+    const obj = this.objects.get(oid);
+    if (obj === undefined || obj.type !== 'tree') return undefined;
+    const entries = parseTree(obj.data);
+    this.treeCache.set(oid, entries);
+    return entries;
   }
 }
 
@@ -265,10 +296,9 @@ export function collectReachable(
     const oid = commitQueue.pop() as string;
     if (seenCommit.has(oid) || stopAt.has(oid)) continue;
     seenCommit.add(oid);
-    const obj = store.get(oid);
-    if (obj === undefined || obj.type !== 'commit') continue;
+    const info = store.commitInfo(oid);
+    if (info === undefined) continue;
     commits.push(oid);
-    const info = parseCommit(obj.data);
     treeQueue.push(info.tree);
     for (const p of info.parents) commitQueue.push(p);
   }
@@ -276,10 +306,10 @@ export function collectReachable(
     const oid = treeQueue.pop() as string;
     if (seenTree.has(oid)) continue;
     seenTree.add(oid);
-    const obj = store.get(oid);
-    if (obj === undefined || obj.type !== 'tree') continue;
+    const entries = store.treeEntries(oid);
+    if (entries === undefined) continue;
     trees.push(oid);
-    for (const e of parseTree(obj.data)) {
+    for (const e of entries) {
       if (e.mode === '40000') treeQueue.push(e.oid);
       else if (!seenBlob.has(e.oid)) {
         seenBlob.add(e.oid);
@@ -299,9 +329,8 @@ export function isAncestor(store: ObjectStore, ancestor: string, tip: string): b
     const oid = queue.pop() as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const obj = store.get(oid);
-    if (obj === undefined || obj.type !== 'commit') continue;
-    const info = parseCommit(obj.data);
+    const info = store.commitInfo(oid);
+    if (info === undefined) continue;
     for (const p of info.parents) {
       if (p === ancestor) return true;
       queue.push(p);

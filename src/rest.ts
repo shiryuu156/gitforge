@@ -18,7 +18,6 @@ import {
   resolveRef,
   squashMerge,
 } from './git-repo.ts';
-import { parseTree } from './git-objects.ts';
 import { VIEWER, type ForgeStore, type Issue, type Pull, type Repo } from './store.ts';
 import {
   isAuthenticated,
@@ -29,6 +28,7 @@ import {
   requestOrigin,
   sendError,
   sendJson,
+  sendJsonText,
   sendNoContent,
 } from './http-utils.ts';
 
@@ -99,6 +99,21 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
     assignees: [],
     milestone: null,
   };
+}
+
+/** The issue's serialized REST JSON, cached on the issue (see store.ts Issue.jsonCache). */
+function issueJsonText(repo: Repo, issue: Issue): { text: string; byteLength: number } {
+  const cached = issue.jsonCache;
+  if (cached !== null) return cached;
+  const text = JSON.stringify(issueJson(repo, issue));
+  const entry = { text, byteLength: Buffer.byteLength(text) };
+  issue.jsonCache = entry;
+  return entry;
+}
+
+/** Drop every issue's cached JSON in a repo (label colors feed into issue bodies). */
+function invalidateIssueCaches(repo: Repo): void {
+  for (const issue of repo.issues) issue.jsonCache = null;
 }
 
 function commentJson(comment: { id: number; body: string }): Record<string, unknown> {
@@ -415,7 +430,7 @@ export function handleRest(
             return true;
           }
           const treeOid = commitTree(repo.objects, tip);
-          const entries = treeOid === undefined ? [] : parseTree(repo.objects.get(treeOid)?.data ?? Buffer.alloc(0));
+          const entries = treeOid === undefined ? [] : repo.objects.treeEntries(treeOid) ?? [];
           sendJson(
             res,
             200,
@@ -554,6 +569,7 @@ export function handleRest(
         }
         const color = asString(json.color) ?? 'ededed';
         repo.labels.set(name, { name, color });
+        invalidateIssueCaches(repo); // label colors feed into cached issue bodies
         sendJson(res, 201, { name, color, description: '' });
         return true;
       }
@@ -587,7 +603,8 @@ export function handleRest(
             }
           }
           const issue = store.createIssue(repo, title, bodyText, labels);
-          sendJson(res, 201, issueJson(repo, issue));
+          const serialized = issueJsonText(repo, issue);
+          sendJsonText(res, 201, serialized.text, serialized.byteLength);
           return true;
         }
         if (method === 'GET') {
@@ -610,7 +627,10 @@ export function handleRest(
           const perPage = Math.max(1, Number.parseInt(search.get('per_page') ?? '30', 10) || 30);
           const page = Math.max(1, Number.parseInt(search.get('page') ?? '1', 10) || 1);
           const start = (page - 1) * perPage;
-          sendJson(res, 200, issues.slice(start, start + perPage).map((issue) => issueJson(repo, issue)));
+          // Join the cached per-issue JSON texts instead of re-stringifying objects.
+          const pageIssues = issues.slice(start, start + perPage);
+          const text = `[${pageIssues.map((issue) => issueJsonText(repo, issue).text).join(',')}]`;
+          sendJsonText(res, 200, text);
           return true;
         }
         sendError(res, 404, 'Not Found');
@@ -624,7 +644,8 @@ export function handleRest(
           return true;
         }
         if (method === 'GET') {
-          sendJson(res, 200, issueJson(repo, issue));
+          const serialized = issueJsonText(repo, issue);
+          sendJsonText(res, 200, serialized.text, serialized.byteLength);
           return true;
         }
         if (method === 'PATCH') {
@@ -634,7 +655,9 @@ export function handleRest(
           if (title !== undefined) issue.title = title;
           const bodyText = asString(json.body);
           if (bodyText !== undefined) issue.body = bodyText;
-          sendJson(res, 200, issueJson(repo, issue));
+          issue.jsonCache = null;
+          const serialized = issueJsonText(repo, issue);
+          sendJsonText(res, 200, serialized.text, serialized.byteLength);
           return true;
         }
         sendError(res, 404, 'Not Found');
@@ -652,6 +675,7 @@ export function handleRest(
             return true;
           }
           const comment = store.addComment(issue, bodyText);
+          issue.jsonCache = null; // comments count changed
           sendJson(res, 201, commentJson(comment));
           return true;
         }

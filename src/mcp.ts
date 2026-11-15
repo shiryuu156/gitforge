@@ -8,7 +8,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { branchRef, refTip, squashMerge } from './git-repo.ts';
 import { VIEWER, type ForgeStore, type Repo } from './store.ts';
-import { isAuthenticated, nextRequestId } from './http-utils.ts';
+import { isAuthenticated, nextRequestId, parseUrl } from './http-utils.ts';
 
 const SERVER_NAME = 'makefun-github-forge';
 const SERVER_VERSION = '1.0.0';
@@ -349,12 +349,7 @@ function callTool(store: ForgeStore, tool: ToolDef, args: Args): { error?: { cod
  * Notifications (requests without an id) are answered 202 with an empty body.
  */
 export function handleMcp(req: IncomingMessage, res: ServerResponse, rawBody: Buffer, store: ForgeStore): boolean {
-  let pathname = '/';
-  try {
-    pathname = new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    pathname = '/';
-  }
+  const { pathname } = parseUrl(req);
   if (pathname !== '/mcp') return false;
 
   if ((req.method ?? 'GET') === 'DELETE') {

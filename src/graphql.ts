@@ -8,7 +8,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { branchRef, commitTree, diffTrees, mergeBase, refTip, squashMerge } from './git-repo.ts';
 import { VIEWER, type ForgeStore, type Issue, type Pull, type Repo } from './store.ts';
-import { isAuthenticated, parseJsonBody, sendError, sendJson } from './http-utils.ts';
+import { isAuthenticated, parseJsonBody, parseUrl, sendError, sendJson } from './http-utils.ts';
 
 // ---------------------------------------------------------------- global ids
 
@@ -612,6 +612,7 @@ function resolveField(parent: Obj | null, parentType: string, field: FieldNode, 
       const issue = repo?.issues.find((i) => i.number === decoded.number);
       if (repo === undefined || issue === undefined) return null;
       issue.state = 'closed';
+      issue.jsonCache = null; // REST cache: state changed
       return select({ __typename: 'CloseIssuePayload', repo, issue }, 'CloseIssuePayload');
     }
     if (field.name === 'createPullRequest') {
@@ -653,6 +654,7 @@ function resolveField(parent: Obj | null, parentType: string, field: FieldNode, 
       const issue = repo?.issues.find((i) => i.number === decoded.number);
       if (repo === undefined || issue === undefined) return null;
       const comment = ctx.store.addComment(issue, (input.body as string) ?? '');
+      issue.jsonCache = null; // REST cache: comments count changed
       return select({ __typename: 'AddCommentPayload', comment }, 'AddCommentPayload');
     }
   }
@@ -961,12 +963,7 @@ export function handleGraphQL(
   store: ForgeStore,
 ): boolean {
   if (req.url === undefined) return false;
-  let pathname = '/';
-  try {
-    pathname = new URL(req.url, 'http://entry').pathname;
-  } catch {
-    pathname = '/';
-  }
+  const { pathname } = parseUrl(req);
   if (pathname !== '/api/graphql') return false;
   if ((req.method ?? 'GET') !== 'POST') {
     sendError(res, 404, 'Not Found');

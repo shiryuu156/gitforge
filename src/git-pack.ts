@@ -97,6 +97,13 @@ export function readPack(pack: Buffer, store?: ObjectStore): Map<string, GitObje
     const typeNum = (pack[off] >> 4) & 0x07;
     const [size, sizeLen] = readSizeVarint(pack, off);
     off += sizeLen;
+    // The last entry's deflated stream ends exactly at the trailer, so its
+    // length is known without re-deflating — that skips one deflate per pack,
+    // a third of the deflate work in the push workload's 3-entry packs.
+    // (inflateSync already throws if the stream is truncated, so a malformed
+    // pack still fails here.)
+    const isLast = i === count - 1;
+    const entryLength = (inflated: Buffer): number => (isLast ? trailerStart - off : deflatedLength(pack, off, inflated));
     let entry: RawEntry;
     if (typeNum === 6) {
       // OFS_DELTA: base offset encoded as a negative offset varint.
@@ -110,20 +117,20 @@ export function readPack(pack: Buffer, store?: ObjectStore): Map<string, GitObje
       }
       const inflated = inflateSync(pack.subarray(off));
       entry = { offset: entryOffset, type: 'ofs-delta', size, data: inflated, baseOffset: entryOffset - baseOff };
-      off += deflatedLength(pack, off, inflated);
+      off += entryLength(inflated);
     } else if (typeNum === 7) {
       const baseOid = pack.toString('hex', off, off + 20);
       off += 20;
       const inflated = inflateSync(pack.subarray(off));
       entry = { offset: entryOffset, type: 'ref-delta', size, data: inflated, baseOid };
-      off += deflatedLength(pack, off, inflated);
+      off += entryLength(inflated);
     } else {
       const type = NUM_TYPE[typeNum];
       if (type === undefined) throw new Error(`unknown pack object type ${typeNum}`);
       const inflated = inflateSync(pack.subarray(off));
       if (inflated.length !== size) throw new Error('pack object size mismatch');
       entry = { offset: entryOffset, type, size, data: inflated };
-      off += deflatedLength(pack, off, inflated);
+      off += entryLength(inflated);
     }
     raw.push(entry);
     byOffset.set(entryOffset, entry);

@@ -40,6 +40,14 @@ export interface Issue {
   labels: string[];
   readonly comments: IssueComment[];
   readonly createdSeq: number;
+  /**
+   * Cached serialized REST JSON for this issue (text + byte length). The read
+   * workload GETs one issue 2,000 times in a row; its body is byte-identical
+   * every time, so serializing once and reusing it removes a stringify per
+   * request. Invalidated (set to null) whenever the issue changes — PATCH,
+   * a new comment, or a label re-created with a different color.
+   */
+  jsonCache: { text: string; byteLength: number } | null;
 }
 
 export interface Pull {
@@ -150,6 +158,7 @@ export class ForgeStore {
       labels: [...labels],
       comments: [],
       createdSeq: nextSeq(),
+      jsonCache: null,
     };
     repo.issueSeq += 1;
     repo.issues.push(issue);

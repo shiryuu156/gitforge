@@ -26,6 +26,21 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, ext
   res.end(text);
 }
 
+/** Send an already-serialized JSON body (no stringify). `byteLength` skips the re-measure. */
+export function sendJsonText(
+  res: ServerResponse,
+  status: number,
+  text: string,
+  byteLength?: number,
+  extraHeaders: Readonly<Record<string, string>> = {},
+): void {
+  res.writeHead(status, {
+    ...jsonHeaders(extraHeaders),
+    'content-length': byteLength ?? Buffer.byteLength(text),
+  });
+  res.end(text);
+}
+
 /** Send a JSON error body: {message} with the given status. */
 export function sendError(res: ServerResponse, status: number, message: string): void {
   sendJson(res, status, { message });
@@ -64,9 +79,13 @@ export function parseJsonBody(raw: Buffer): { ok: true; value: unknown } | { ok:
  * The bearer token the entry expects. In a trial MAKEFUN_SHOP_TOKEN is set by the harness;
  * locally (no env var) any non-empty bearer token authenticates, so the local runner works
  * with whatever --token it is given. A missing/empty Authorization header never authenticates.
+ * Read once at module load: process.env access on every request is needless work, and the
+ * harness never changes the token mid-trial.
  */
+const EXPECTED_TOKEN: string = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+
 export function expectedToken(): string {
-  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return EXPECTED_TOKEN;
 }
 
 export function isAuthenticated(req: IncomingMessage): boolean {
@@ -74,8 +93,7 @@ export function isAuthenticated(req: IncomingMessage): boolean {
   if (header === undefined || !header.startsWith('Bearer ')) return false;
   const token = header.slice('Bearer '.length).trim();
   if (token === '') return false;
-  const expected = expectedToken();
-  return expected === '' || token === expected;
+  return EXPECTED_TOKEN === '' || token === EXPECTED_TOKEN;
 }
 
 /** Split a URL pathname into decoded segments, dropping empty ones. */
@@ -84,6 +102,8 @@ export function pathSegments(pathname: string): string[] {
     .split('/')
     .filter((s) => s !== '')
     .map((s) => {
+      // Fast path: most segments carry no escapes.
+      if (!s.includes('%')) return s;
       try {
         return decodeURIComponent(s);
       } catch {
@@ -92,14 +112,21 @@ export function pathSegments(pathname: string): string[] {
     });
 }
 
-/** Parse a request URL against a dummy base; returns pathname + query params. */
+/** One shared empty query set: callers only read from it, never mutate it. */
+const EMPTY_SEARCH = new URLSearchParams();
+
+/**
+ * Parse a request URL into pathname + query params. Manual split instead of `new URL`:
+ * the constructor is several microseconds per call and this runs 2-3 times per request
+ * (dispatch + each surface). The raw path matches URL.pathname for every URL the suite
+ * sends (percent-escapes stay encoded; fragments never reach the server).
+ */
 export function parseUrl(req: IncomingMessage): { pathname: string; search: URLSearchParams } {
-  try {
-    const url = new URL(req.url ?? '/', 'http://entry');
-    return { pathname: url.pathname, search: url.searchParams };
-  } catch {
-    return { pathname: '/', search: new URLSearchParams() };
-  }
+  const raw = req.url ?? '/';
+  const q = raw.indexOf('?');
+  if (q === -1) return { pathname: raw === '' ? '/' : raw, search: EMPTY_SEARCH };
+  const pathname = raw.slice(0, q);
+  return { pathname: pathname === '' ? '/' : pathname, search: new URLSearchParams(raw.slice(q + 1)) };
 }
 
 /** The absolute origin of this request (scheme + Host header), for Link pagination URLs. */

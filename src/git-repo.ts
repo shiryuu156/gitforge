@@ -9,9 +9,7 @@ import {
   hashObject,
   identLine,
   isAncestor,
-  parseCommit,
   parseIdent,
-  parseTree,
   type GitObject,
   type ObjectStore,
   type TreeEntry,
@@ -48,9 +46,9 @@ export function resolveRef(repo: Repo, refish: string): string | undefined {
 export function flattenTree(store: ObjectStore, treeOid: string, prefix = ''): Map<string, { oid: string; mode: string }> {
   const out = new Map<string, { oid: string; mode: string }>();
   const walk = (oid: string, dir: string): void => {
-    const obj = store.get(oid);
-    if (obj === undefined || obj.type !== 'tree') return;
-    for (const entry of parseTree(obj.data)) {
+    const entries = store.treeEntries(oid);
+    if (entries === undefined) return;
+    for (const entry of entries) {
       const path = dir === '' ? entry.name : `${dir}/${entry.name}`;
       if (entry.mode === '40000') {
         walk(entry.oid, path);
@@ -115,9 +113,7 @@ export function treeFromFlat(store: ObjectStore, flat: ReadonlyMap<string, { oid
 
 /** The tree oid of a commit. */
 export function commitTree(store: ObjectStore, commitOid: string): string | undefined {
-  const obj = store.get(commitOid);
-  if (obj === undefined || obj.type !== 'commit') return undefined;
-  return parseCommit(obj.data).tree;
+  return store.commitInfo(commitOid)?.tree;
 }
 
 /** Read one path from a tree: file (blob) or directory (entries). */
@@ -132,17 +128,16 @@ export function readTreePath(
   const parts = path.split('/').filter((p) => p !== '');
   let current = treeOid;
   for (let i = 0; i < parts.length; i += 1) {
-    const obj = store.get(current);
-    if (obj === undefined || obj.type !== 'tree') return undefined;
-    const entries = parseTree(obj.data);
+    const entries = store.treeEntries(current);
+    if (entries === undefined) return undefined;
     const entry = entries.find((e) => e.name === parts[i]);
     if (entry === undefined) return undefined;
     const last = i === parts.length - 1;
     if (entry.mode === '40000') {
       if (last) {
-        const dirObj = store.get(entry.oid);
-        if (dirObj === undefined || dirObj.type !== 'tree') return undefined;
-        return { kind: 'dir', entries: parseTree(dirObj.data) };
+        const dirEntries = store.treeEntries(entry.oid);
+        if (dirEntries === undefined) return undefined;
+        return { kind: 'dir', entries: dirEntries };
       }
       current = entry.oid;
     } else {
@@ -231,9 +226,8 @@ export interface CommitInfo {
 
 /** Parse a commit object into CommitInfo (undefined when missing/not a commit). */
 export function readCommit(store: ObjectStore, oid: string): CommitInfo | undefined {
-  const obj = store.get(oid);
-  if (obj === undefined || obj.type !== 'commit') return undefined;
-  const parsed = parseCommit(obj.data);
+  const parsed = store.commitInfo(oid);
+  if (parsed === undefined) return undefined;
   return {
     sha: oid,
     message: parsed.message,
@@ -272,8 +266,8 @@ export function mergeBase(store: ObjectStore, a: string, b: string): string | un
   // Ancestors of A with their distance from A.
   const ancestorsA = new Map<string, number>();
   const queue: Array<[string, number]> = [[a, 0]];
-  while (queue.length > 0) {
-    const [oid, depth] = queue.shift() as [string, number];
+  for (let qi = 0; qi < queue.length; qi += 1) {
+    const [oid, depth] = queue[qi] as [string, number];
     if (ancestorsA.has(oid)) continue;
     ancestorsA.set(oid, depth);
     const info = readCommit(store, oid);
@@ -284,8 +278,8 @@ export function mergeBase(store: ObjectStore, a: string, b: string): string | un
   // BFS from B: the first commit also in A's ancestors, nearest to B, is the merge base.
   const seenB = new Set<string>();
   const queueB: string[] = [b];
-  while (queueB.length > 0) {
-    const oid = queueB.shift() as string;
+  for (let qi = 0; qi < queueB.length; qi += 1) {
+    const oid = queueB[qi] as string;
     if (seenB.has(oid)) continue;
     seenB.add(oid);
     if (ancestorsA.has(oid)) return oid;

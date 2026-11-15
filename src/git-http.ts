@@ -10,9 +10,6 @@ import {
   collectReachable,
   isAncestor,
   isOid,
-  parseCommit,
-  parseTag,
-  parseTree,
   peelToCommit,
   type GitObject,
   type ObjectStore,
@@ -20,7 +17,7 @@ import {
 import { readPack, writePack } from './git-pack.ts';
 import { pktDelim, pktFlush, pktLine, pktLines, parsePktLines, splitPktAndRest } from './git-pktline.ts';
 import { VIEWER, type ForgeStore, type Repo } from './store.ts';
-import { nextRequestId } from './http-utils.ts';
+import { nextRequestId, parseUrl } from './http-utils.ts';
 
 const UPLOAD_ADVERTISEMENT = 'application/x-git-upload-pack-advertisement';
 const RECEIVE_ADVERTISEMENT = 'application/x-git-receive-pack-advertisement';
@@ -195,19 +192,22 @@ function parseFetchV2(lines: string[]): FetchRequest {
 
 /** The tree/blob closure of one commit (its tree, subtrees and blobs) — parents NOT followed. */
 function treeClosure(store: ObjectStore, commitOid: string, out: Set<string>): void {
-  const commit = store.get(commitOid);
-  if (commit === undefined || commit.type !== 'commit') return;
-  const treeOid = parseCommit(commit.data).tree;
-  const stack: string[] = [treeOid];
+  const info = store.commitInfo(commitOid);
+  if (info === undefined) return;
+  const stack: string[] = [info.tree];
   while (stack.length > 0) {
     const oid = stack.pop() as string;
     if (out.has(oid)) continue;
-    const obj = store.get(oid);
-    if (obj === undefined) continue;
-    out.add(oid);
-    if (obj.type === 'tree') {
-      for (const entry of parseTree(obj.data)) stack.push(entry.oid);
+    const entries = store.treeEntries(oid);
+    if (entries !== undefined) {
+      // A tree: add it and traverse its entries.
+      out.add(oid);
+      for (const entry of entries) stack.push(entry.oid);
+    } else if (store.has(oid)) {
+      // A blob (or other non-tree object): add it, do not traverse.
+      out.add(oid);
     }
+    // Missing objects are skipped.
   }
 }
 
@@ -272,17 +272,18 @@ function computeFetch(
     // Blob/tree wants are not sent by the client; ignore them.
   }
 
-  // BFS over commits by generation (want = generation 1).
+  // BFS over commits by generation (want = generation 1). Index-pointer queue:
+  // Array.shift() is O(n) per pop, which turns a 200-commit walk quadratic.
   const includedCommits = new Set<string>();
   const shallow = new Set<string>();
   const queue: Array<[string, number]> = wantCommits.map((oid) => [oid, 1]);
   const seen = new Set<string>();
-  while (queue.length > 0) {
-    const [oid, generation] = queue.shift() as [string, number];
+  for (let qi = 0; qi < queue.length; qi += 1) {
+    const [oid, generation] = queue[qi] as [string, number];
     if (seen.has(oid)) continue;
     seen.add(oid);
-    const obj = store.get(oid);
-    if (obj === undefined || obj.type !== 'commit') continue;
+    const info = store.commitInfo(oid);
+    if (info === undefined) continue;
     includedCommits.add(oid);
     // Stop at the depth boundary: the commit is shallow, its parents are not traversed.
     if (req.deepen !== undefined && generation >= req.deepen) {
@@ -294,7 +295,7 @@ function computeFetch(
     // means: the client holds the tip and asks for the generation below it), so traversal
     // continues through haves when a depth limit is in force.
     if (req.deepen === undefined && haves.has(oid)) continue;
-    for (const parent of parseCommit(obj.data).parents) {
+    for (const parent of info.parents) {
       if (!seen.has(parent)) queue.push([parent, generation + 1]);
     }
   }
@@ -316,10 +317,9 @@ function computeFetch(
   const unshallow: string[] = [];
   for (const oid of req.shallow) {
     if (shallow.has(oid)) continue; // still on the boundary
-    const obj = store.get(oid);
-    if (obj === undefined || obj.type !== 'commit') continue;
-    const parents = parseCommit(obj.data).parents;
-    if (parents.some((p) => includedCommits.has(p) && !excluded.has(p))) {
+    const info = store.commitInfo(oid);
+    if (info === undefined) continue;
+    if (info.parents.some((p) => includedCommits.has(p) && !excluded.has(p))) {
       unshallow.push(oid);
     }
   }
@@ -339,8 +339,61 @@ function sidebandPack(pack: Buffer): Buffer {
   return Buffer.concat(parts);
 }
 
+/**
+ * Fetch-response cache, per repo. A fetch result for fixed (wants, haves, deepen,
+ * shallow) is immutable once computed: objects are never modified or removed, and
+ * the reachable set from a want oid cannot grow (new objects cannot become
+ * ancestors of an existing commit). The clone workload fires 50 identical shallow
+ * clones at once, so one computation serves all 50. Only cached when every want,
+ * have and shallow oid resolved to an object at compute time — an oid that was
+ * missing then could appear later and change the answer.
+ */
+const fetchCaches = new WeakMap<Repo, Map<string, Buffer>>();
+const FETCH_CACHE_MAX = 128;
+
+function fetchCacheKey(version: 'v0' | 'v2', req: FetchRequest): string {
+  return [
+    version,
+    [...req.wants].sort().join(','),
+    [...req.haves].sort().join(','),
+    req.deepen ?? '',
+    [...req.shallow].sort().join(','),
+  ].join('|');
+}
+
+function fetchCached(repo: Repo, version: 'v0' | 'v2', req: FetchRequest): Buffer | undefined {
+  return fetchCaches.get(repo)?.get(fetchCacheKey(version, req));
+}
+
+function fetchCacheStore(repo: Repo, version: 'v0' | 'v2', req: FetchRequest, response: Buffer): void {
+  // Only cache when every want, have and shallow oid existed at compute time (see
+  // above): a have that was missing then would exclude nothing, but if its objects
+  // appear later the same request should exclude its ancestry — a stale cached
+  // response would send objects the client already holds. Same for shallow oids
+  // (the unshallow list depends on them).
+  for (const want of req.wants) {
+    if (repo.objects.get(want) === undefined) return;
+  }
+  for (const have of req.haves) {
+    if (repo.objects.get(have) === undefined) return;
+  }
+  for (const oid of req.shallow) {
+    if (repo.objects.get(oid) === undefined) return;
+  }
+  let cache = fetchCaches.get(repo);
+  if (cache === undefined) {
+    cache = new Map<string, Buffer>();
+    fetchCaches.set(repo, cache);
+  }
+  if (cache.size >= FETCH_CACHE_MAX) cache.clear();
+  cache.set(fetchCacheKey(version, req), response);
+}
+
 /** Build the v2 fetch response for a computed fetch. */
-function fetchResponseV2(store: ObjectStore, req: FetchRequest): Buffer {
+function fetchResponseV2(repo: Repo, req: FetchRequest): Buffer {
+  const cached = fetchCached(repo, 'v2', req);
+  if (cached !== undefined) return cached;
+  const store = repo.objects;
   const { objects, shallow, unshallow } = computeFetch(store, req);
   const parts: Buffer[] = [];
 
@@ -373,11 +426,16 @@ function fetchResponseV2(store: ObjectStore, req: FetchRequest): Buffer {
     parts.push(pktFlush());
   }
 
-  return Buffer.concat(parts);
+  const response = Buffer.concat(parts);
+  fetchCacheStore(repo, 'v2', req, response);
+  return response;
 }
 
 /** Build the v0 fetch response (fallback path): shallow lines, NAK/ACK, sideband pack. */
-function fetchResponseV0(store: ObjectStore, req: FetchRequest): Buffer {
+function fetchResponseV0(repo: Repo, req: FetchRequest): Buffer {
+  const cached = fetchCached(repo, 'v0', req);
+  if (cached !== undefined) return cached;
+  const store = repo.objects;
   const { objects, shallow, unshallow } = computeFetch(store, req);
   const parts: Buffer[] = [];
   for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
@@ -394,7 +452,9 @@ function fetchResponseV0(store: ObjectStore, req: FetchRequest): Buffer {
     parts.push(sidebandPack(writePack(entries)));
   }
   parts.push(pktFlush());
-  return Buffer.concat(parts);
+  const response = Buffer.concat(parts);
+  fetchCacheStore(repo, 'v0', req, response);
+  return response;
 }
 
 // ---------------------------------------------------------------- receive-pack (push)
@@ -500,15 +560,7 @@ export function handleGit(
   rawBody: Buffer,
   store: ForgeStore,
 ): boolean {
-  let pathname = '/';
-  let search = new URLSearchParams();
-  try {
-    const url = new URL(req.url ?? '/', 'http://entry');
-    pathname = url.pathname;
-    search = url.searchParams;
-  } catch {
-    return false;
-  }
+  const { pathname, search } = parseUrl(req);
   // /<owner>/<repo>.git/<endpoint>
   const match = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(pathname);
   if (match === null) return false;
@@ -565,7 +617,7 @@ export function handleGit(
           sendGit400(res, 'fetch requires at least one want');
           return true;
         }
-        sendGit(res, 200, UPLOAD_RESULT, fetchResponseV2(repo.objects, req2));
+        sendGit(res, 200, UPLOAD_RESULT, fetchResponseV2(repo, req2));
         return true;
       }
       if (first.startsWith('want ')) {
@@ -575,7 +627,7 @@ export function handleGit(
           sendGit400(res, 'fetch requires at least one want');
           return true;
         }
-        sendGit(res, 200, UPLOAD_RESULT, fetchResponseV0(repo.objects, v0Req));
+        sendGit(res, 200, UPLOAD_RESULT, fetchResponseV0(repo, v0Req));
         return true;
       }
       sendGit400(res, 'unknown upload-pack command');
